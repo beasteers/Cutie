@@ -126,7 +126,7 @@ class MainController():
     def initialize_networks(self) -> None:
         download_models_if_needed()
         self.cutie = CUTIE(self.cfg).eval().to(self.device)
-        model_weights = torch.load(self.cfg.weights)
+        model_weights = torch.load(self.cfg.weights, map_location=self.device)
         self.cutie.load_weights(model_weights)
 
         self.click_ctrl = ClickController(self.cfg.ritm_weights, device=self.device)
@@ -149,7 +149,7 @@ class MainController():
         last_interaction = self.interaction
         new_interaction = None
 
-        with autocast(self.device, enabled=self.amp):
+        with autocast('cpu' if self.device == 'mps' else self.device, enabled=self.amp and self.device != 'mps'):
             if action in ['left', 'right']:
                 # left: positive click
                 # right: negative click
@@ -289,7 +289,7 @@ class MainController():
 
     def on_propagate(self):
         # start to propagate
-        with autocast(self.device, enabled=self.amp):
+        with autocast('cpu' if self.device == 'mps' else self.device, enabled=self.amp and self.device != 'mps'):
             self.convert_current_image_mask_torch()
 
             self.gui.text(f'Propagation started at t={self.curr_ti}.')
@@ -349,7 +349,7 @@ class MainController():
             self.complete_interaction()
             self.update_interacted_mask()
 
-        with autocast(self.device, enabled=self.amp):
+        with autocast('cpu' if self.device == 'mps' else self.device, enabled=self.amp and self.device != 'mps'):
             self.convert_current_image_mask_torch()
             self.gui.text(f'Permanent memory saved at {self.curr_ti}.')
             self.curr_prob = self.processor.step(self.curr_image_torch,
