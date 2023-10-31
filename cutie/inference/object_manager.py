@@ -17,6 +17,9 @@ class ObjectManager:
 
         self.all_historical_object_ids: List[int] = []
 
+    def __getitem__(self, obj_id):
+        return self.obj_id_to_obj[obj_id]
+
     def _recompute_obj_id_to_obj_mapping(self) -> None:
         self.obj_id_to_obj = {obj.id: obj for obj in self.obj_to_tmp_id}
 
@@ -28,7 +31,10 @@ class ObjectManager:
 
         corresponding_tmp_ids = []
         corresponding_obj_ids = []
+        max_obj_id = max(self.all_historical_object_ids, default=0)
         for obj in objects:
+            if obj is None:
+                max_obj_id = obj = max_obj_id + 1
             if isinstance(obj, int):
                 obj = ObjectInfo(id=obj)
 
@@ -49,7 +55,7 @@ class ObjectManager:
                 corresponding_obj_ids.append(new_obj.id)
 
         self._recompute_obj_id_to_obj_mapping()
-        assert corresponding_tmp_ids == sorted(corresponding_tmp_ids)
+        # assert corresponding_tmp_ids == sorted(corresponding_tmp_ids)
         return corresponding_tmp_ids, corresponding_obj_ids
 
     def delete_object(self, obj_ids_to_remove: Union[int, List[int]]) -> None:
@@ -85,6 +91,26 @@ class ObjectManager:
 
         for obj in self.obj_to_tmp_id:
             if obj.poke_count > max_missed_detection_count:
+                obj_id_to_be_deleted.append(obj.id)
+                tmp_id_to_be_deleted.append(self.obj_to_tmp_id[obj])
+            else:
+                tmp_id_to_keep.append(self.obj_to_tmp_id[obj])
+                obj_id_to_keep.append(obj.id)
+
+        purge_activated = len(obj_id_to_be_deleted) > 0
+        if purge_activated:
+            self.delete_object(obj_id_to_be_deleted)
+        return purge_activated, tmp_id_to_keep, obj_id_to_keep
+    
+    def purge_false_positive_objects(self, min_seen_count: int, max_exist_count: int) -> (bool, List[int], List[int]):
+        # remove tmp ids of objects that are removed
+        obj_id_to_be_deleted = []
+        tmp_id_to_be_deleted = []
+        tmp_id_to_keep = []
+        obj_id_to_keep = []
+
+        for obj in self.obj_to_tmp_id:
+            if obj.seen_count < min_seen_count and obj.exist_count > max_exist_count:
                 obj_id_to_be_deleted.append(obj.id)
                 tmp_id_to_be_deleted.append(self.obj_to_tmp_id[obj])
             else:

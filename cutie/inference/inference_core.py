@@ -3,6 +3,7 @@ import logging
 from omegaconf import DictConfig
 
 import numpy as np
+from cutie.inference.assignment import ObjectAssignment
 import torch
 import torch.nn.functional as F
 
@@ -15,12 +16,13 @@ from cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate
 log = logging.getLogger()
 
 
-class InferenceCore:
+class InferenceCore(torch.nn.Module):
     def __init__(self,
                  network: CUTIE,
                  cfg: DictConfig,
                  *,
                  image_feature_store: ImageFeatureStore = None):
+        super().__init__()
         self.network = network
         self.cfg = cfg
         self.mem_every = cfg.mem_every
@@ -29,6 +31,11 @@ class InferenceCore:
         self.save_aux = cfg.save_aux
         self.max_internal_size = cfg.max_internal_size
         self.flip_aug = cfg.flip_aug
+        self.max_missed_detection_count = cfg.max_missed_detection_count
+        self.min_seen_count = cfg.min_seen_count
+        self.max_tentative_exist_count = cfg.max_tentative_exist_count
+        self.return_object_ids = cfg.return_object_ids
+        self.binarize_mask = cfg.binarize_mask
 
         self.curr_ti = -1
         self.last_mem_ti = 0
@@ -47,6 +54,8 @@ class InferenceCore:
             self.image_feature_store = image_feature_store
 
         self.last_mask = None
+        # so we know what device we're on
+        self._device_param = torch.nn.Parameter(torch.empty(0))
 
     def clear_memory(self):
         self.curr_ti = -1
@@ -168,15 +177,17 @@ class InferenceCore:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
         return pred_prob_with_bg
 
-    def step(self,
-             image: torch.Tensor,
-             mask: Optional[torch.Tensor] = None,
-             objects: Optional[List[int]] = None,
-             *,
-             idx_mask: bool = True,
-             end: bool = False,
-             delete_buffer: bool = True,
-             force_permanent: bool = False) -> torch.Tensor:
+    def forward(
+            self,
+            image: torch.Tensor,
+            mask: torch.Tensor = None,
+            objects: Optional[List[int]] = None,
+            *,
+            idx_mask: Optional[bool] = None,
+            end: bool = False,
+            delete_buffer: bool = True,
+            only_confirmed: bool = True,
+            force_permanent: bool = False) -> torch.Tensor:
         """
         Take a step with a new incoming image.
         If there is an incoming mask with new objects, we will memorize them.
@@ -198,9 +209,11 @@ class InferenceCore:
         delete_buffer: whether to delete the image feature buffer after this step
         force_permanent: the memory recorded this frame will be added to the permanent memory
         """
-        if objects is None and mask is not None:
-            assert not idx_mask
-            objects = list(range(1, mask.shape[0] + 1))
+        if not torch.is_tensor(image):
+            image = image.transpose(2, 0, 1)
+            image = torch.from_numpy(image).float().to(self._device_param.device, non_blocking=True) / 255
+        if mask is not None and mask.shape[0] == 0:
+            mask = None
 
         # resize input if needed -- currently only used for the GUI
         resize_needed = False
@@ -215,18 +228,6 @@ class InferenceCore:
                                       size=(new_h, new_w),
                                       mode='bilinear',
                                       align_corners=False)[0]
-                if mask is not None:
-                    if idx_mask:
-                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(),
-                                             size=(new_h, new_w),
-                                             mode='nearest',
-                                             align_corners=False)[0, 0].round().long()
-                    else:
-                        mask = F.interpolate(mask.unsqueeze(0),
-                                             size=(new_h, new_w),
-                                             mode='bilinear',
-                                             align_corners=False)[0]
-
         self.curr_ti += 1
 
         image, self.pad = pad_divide_by(image, 16)
@@ -238,8 +239,8 @@ class InferenceCore:
         is_mem_frame = ((self.curr_ti - self.last_mem_ti >= self.mem_every) or
                         (mask is not None)) and (not end)
         # segment when there is no input mask or when the input mask is incomplete
-        need_segment = (mask is None) or (self.object_manager.num_obj > 0
-                                          and not self.object_manager.has_all(objects))
+        need_segment = (mask is None) or isinstance(objects, ObjectAssignment) or (
+            self.object_manager.num_obj > 0 and not self.object_manager.has_all(objects))
         update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
 
         # encoding the image
@@ -255,33 +256,68 @@ class InferenceCore:
                                               update_sensory=update_sensory)
 
         # use the input mask if provided
-        if mask is not None:
+        if mask is None:
+            pass
+        elif mask.shape[0] == 0:
+            objects = []
+        else:
+            # resize mask to proper shape
+            if resize_needed:
+                if idx_mask:
+                    mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(),
+                                         size=(new_h, new_w),
+                                         mode='nearest',
+                                         align_corners=False)[0, 0].round().long()
+                else:
+                    mask = F.interpolate(mask.unsqueeze(0),
+                                         size=(new_h, new_w),
+                                         mode='bilinear',
+                                         align_corners=False)[0]
+            mask, _ = pad_divide_by(mask, 16)
+                    
+            # automatic mask assignment
+            assigner = None
+            labels = None
+            if isinstance(objects, ObjectAssignment):
+                assert not idx_mask
+                assigner = objects
+                mask, tmp_objects, labels = assigner(pred_prob_with_bg, mask)
+                objects = [self.object_manager.tmp_id_to_obj.get(i+1) if i is not None else None for i in tmp_objects]
+            elif mask.ndim == 2:
+                if objects is None:
+                    objects = np.unique(mask)
+
+            # if objects are not defined, assume they are in order
+            if objects is None:
+                assert mask.ndim == 3
+                objects = list(range(1, mask.shape[0] + 1))
+
+            
             # inform the manager of the new objects, and get a list of temporary id
             # temporary ids -- indicates the position of objects in the tensor
             # (starts with 1 due to the background channel)
-            corresponding_tmp_ids, _ = self.object_manager.add_new_objects(objects)
+            corresponding_tmp_ids, objects = self._update_objects(objects, labels=labels)
 
-            mask, _ = pad_divide_by(mask, 16)
             if need_segment:
                 # merge predicted mask with the incomplete input mask
                 pred_prob_no_bg = pred_prob_with_bg[1:]
                 # use the mutual exclusivity of segmentation
                 if idx_mask:
                     pred_prob_no_bg[:, mask > 0] = 0
-                else:
-                    pred_prob_no_bg[:, mask.max(0) > 0.5] = 0
+                elif mask.shape[0]:
+                    pred_prob_no_bg[:, mask.max(0).values > 0.5] = 0
 
                 new_masks = []
-                for mask_id, tmp_id in enumerate(corresponding_tmp_ids):
+                for mask_id, tmp_id in sorted(enumerate(corresponding_tmp_ids), key=lambda x: x[1]):
                     if idx_mask:
                         this_mask = (mask == objects[mask_id]).type_as(pred_prob_no_bg)
                     else:
-                        this_mask = mask[tmp_id]
-                    if tmp_id >= pred_prob_no_bg.shape[0]:
+                        this_mask = mask[mask_id]
+                    if tmp_id-1 >= pred_prob_no_bg.shape[0]:
                         new_masks.append(this_mask.unsqueeze(0))
                     else:
                         # +1 for padding the background channel
-                        pred_prob_no_bg[tmp_id + 1] = this_mask
+                        pred_prob_no_bg[tmp_id-1] = this_mask
                 # new_masks are always in the order of tmp_id
                 mask = torch.cat([pred_prob_no_bg, *new_masks], dim=0)
             elif idx_mask:
@@ -296,6 +332,9 @@ class InferenceCore:
                 mask = torch.stack(
                     [mask == objects[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],
                     dim=0)
+            if assigner is not None:
+                mask = assigner.postprocess(mask)
+            mask = self._purge_objects(mask)
             pred_prob_with_bg = aggregate(mask, dim=0)
             pred_prob_with_bg = torch.softmax(pred_prob_with_bg, dim=0)
 
@@ -324,8 +363,95 @@ class InferenceCore:
                                         size=(h, w),
                                         mode='bilinear',
                                         align_corners=False)[0]
+            
+        object_ids = np.array(self.object_manager.all_obj_ids)
+        if objects is not None:
+            objects = np.array(objects)
 
+        # convert probabilities to binary masks using argmax
+        if self.binarize_mask:
+            output_prob, object_ids = self._binarize_mask(output_prob, object_ids)
+            assert len(object_ids) == len(output_prob) + int(not self.binarize_mask)
+            # output_prob: [num_objects, H, W] if binarize_mask else [1 + num_objects, H, W]
+
+        # only return tracks that have been confirmed by multiple detections
+        if only_confirmed:
+            assert self.binarize_mask, "todo: filter masks ignoring background"
+            output_prob, object_ids = self._filter_confirmed(output_prob, object_ids)
+
+        if self.return_object_ids:
+            return output_prob, object_ids, objects
         return output_prob
+    step = forward
+
+    def _update_objects(self, objects, labels=None):
+        corresponding_tmp_ids, objects = self.object_manager.add_new_objects(objects)
+        for obj_id, obj in self.object_manager.obj_id_to_obj.items():
+            if obj_id in objects:
+                obj.unpoke()
+                if labels is not None:
+                    i = objects.index(obj_id)
+                    obj.update_label(labels[i])
+            else:
+                obj.poke()
+        return corresponding_tmp_ids, objects
+    
+    def _purge_objects(self, merged_mask):
+        if self.max_missed_detection_count:
+            # find inactive objects that we need to delete
+            purge_activated, tmp_keep_idx, obj_keep_idx = self.object_manager.purge_inactive_objects(
+                self.max_missed_detection_count)
+
+            if purge_activated:
+                # purge memory
+                self.memory.purge_except(obj_keep_idx)
+                # purge the merged mask, no background
+                new_list = [i - 1 for i in tmp_keep_idx]
+                merged_mask = merged_mask[new_list]
+        if self.min_seen_count:
+            # find inactive objects that we need to delete
+            purge_activated, tmp_keep_idx, obj_keep_idx = self.object_manager.purge_false_positive_objects(
+                self.min_seen_count, self.max_tentative_exist_count)
+
+            if purge_activated:
+                # purge memory
+                self.memory.purge_except(obj_keep_idx)
+                # purge the merged mask, no background
+                new_list = [i - 1 for i in tmp_keep_idx]
+                merged_mask = merged_mask[new_list]
+        return merged_mask
+
+    def _binarize_mask(self, pred_mask, object_ids):
+        '''Convert logits to argmax binary mask.'''
+        # covert to binary mask
+
+        # remove batch dimension
+        if pred_mask.ndim == 4:
+            pred_mask = pred_mask[0]
+
+        # get the winning index
+        pred_mask_int = torch.argmax(pred_mask, dim=0) - 1
+        pred_ids = torch.arange(len(pred_mask)-1, device=pred_mask.device)
+        pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
+
+        # filter empty
+        present = pred_mask.any(2).any(1)#.cpu().numpy()
+        pred_mask = pred_mask[present]
+        pred_ids = pred_ids[present]
+
+        # what should the output format be?
+        object_ids = object_ids[pred_ids.cpu().numpy()]
+        return pred_mask, object_ids
+
+    def _filter_confirmed(self, pred_mask, object_ids):
+        objs = [self.object_manager[i] for i in object_ids]
+        confirmed = np.array([
+            o.seen_count > self.min_seen_count
+            for o in objs], dtype=bool)
+        pred_mask = pred_mask[confirmed]
+        object_ids = object_ids[confirmed]
+        return pred_mask, object_ids
+
 
     def get_aux_outputs(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         image, pads = pad_divide_by(image, 16)

@@ -11,9 +11,10 @@ hydra:
 exp_id: default
 dataset: d17-val
 amp: False
-weights: output/cutie-base-mega.pth
+weights: weights/cutie-base-mega.pth
 output_dir: null # defaults to run_dir; specify this to override
 flip_aug: False
+max_missed_detection_count: 0
 
 # maximum shortest side of the input; -1 means no resizing
 # With eval_vos.py, we usually just use the dataset's size (resizing done in dataloader)
