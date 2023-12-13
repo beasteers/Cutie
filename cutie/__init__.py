@@ -7,11 +7,11 @@ def get_model(cfg=None, model=None):
 
     cfg = get_config(cfg)
     if model is None:
-        model = get_cutie_model(cfg)
+        model = get_base_model(cfg)
     return InferenceCore(model, cfg)
 
 
-def get_cutie_model(cfg=None):
+def get_base_model(cfg=None):
     from .model.cutie import CUTIE
     from .inference import download_models
     cfg = get_config(cfg)
