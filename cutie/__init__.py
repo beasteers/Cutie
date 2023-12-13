@@ -1,5 +1,4 @@
 import torch
-from omegaconf import DictConfig, open_dict
 
 
 def get_model(cfg=None, model=None):
@@ -21,13 +20,14 @@ def get_base_model(cfg=None):
     return model
 
 
-def get_config(cfg=None):
+def get_config(cfg=None, config_name='inference_config', version_base='1.3.2', config_path="config", job_name="demo"):
+    from omegaconf import DictConfig
     if not isinstance(cfg, DictConfig):
         with torch.inference_mode():
             from hydra import compose, initialize
-            initialize(version_base='1.3.2', config_path="config", job_name="demo")
-            data = cfg
-            cfg = compose(config_name="inference_config")
-            if cfg:
-                cfg.update(data)
+            initialize(version_base=version_base, config_path=config_path, job_name=job_name)
+            update = cfg
+            cfg = compose(config_name=config_name)
+            if update:
+                cfg.update(update)
     return cfg
