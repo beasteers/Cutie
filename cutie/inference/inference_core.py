@@ -3,12 +3,12 @@ import logging
 from omegaconf import DictConfig
 
 import numpy as np
-from cutie.inference.assignment import ObjectAssignment
 import torch
 import torch.nn.functional as F
 
 from cutie.inference.memory_manager import MemoryManager
 from cutie.inference.object_manager import ObjectManager
+from cutie.inference.assignment import ObjectAssignment
 from cutie.inference.image_feature_store import ImageFeatureStore
 from cutie.model.cutie import CUTIE
 from cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate
@@ -17,6 +17,7 @@ log = logging.getLogger()
 
 
 class InferenceCore(torch.nn.Module):
+    Assignment = ObjectAssignment
     def __init__(self,
                  network: CUTIE,
                  cfg: DictConfig,
@@ -57,9 +58,11 @@ class InferenceCore(torch.nn.Module):
         # so we know what device we're on
         self._device_param = torch.nn.Parameter(torch.empty(0))
 
-    def clear_memory(self):
+    def clear_memory(self, objects=False):
         self.curr_ti = -1
         self.last_mem_ti = 0
+        if objects:
+            self.object_manager = ObjectManager()
         self.memory = MemoryManager(cfg=self.cfg, object_manager=self.object_manager)
 
     def clear_non_permanent_memory(self):
@@ -100,7 +103,7 @@ class InferenceCore(torch.nn.Module):
         """
         if prob.shape[1] == 0:
             # nothing to add
-            log.warn('Trying to add an empty object mask to memory!')
+            # log.warn('Trying to add an empty object mask to memory!')
             return
 
         if force_permanent:
@@ -153,7 +156,7 @@ class InferenceCore(torch.nn.Module):
             assert bs == 1
 
         if not self.memory.engaged:
-            log.warn('Trying to segment without any memory!')
+            # log.warn('Trying to segment without any memory!')
             return torch.zeros((1, key.shape[-2] * 16, key.shape[-1] * 16),
                                device=key.device,
                                dtype=key.dtype)
@@ -181,12 +184,13 @@ class InferenceCore(torch.nn.Module):
             self,
             image: torch.Tensor,
             mask: torch.Tensor = None,
-            objects: Optional[List[int]] = None,
+            input_object_ids: Optional[List[int]] = None,
             *,
+            negative_mask: Optional[torch.Tensor] = None,
             idx_mask: Optional[bool] = None,
             end: bool = False,
             delete_buffer: bool = True,
-            only_confirmed: bool = True,
+            only_confirmed: bool = False,
             force_permanent: bool = False) -> torch.Tensor:
         """
         Take a step with a new incoming image.
@@ -239,8 +243,8 @@ class InferenceCore(torch.nn.Module):
         is_mem_frame = ((self.curr_ti - self.last_mem_ti >= self.mem_every) or
                         (mask is not None)) and (not end)
         # segment when there is no input mask or when the input mask is incomplete
-        need_segment = (mask is None) or isinstance(objects, ObjectAssignment) or (
-            self.object_manager.num_obj > 0 and not self.object_manager.has_all(objects))
+        need_segment = (mask is None) or isinstance(input_object_ids, ObjectAssignment) or (
+            self.object_manager.num_obj > 0 and not self.object_manager.has_all(input_object_ids))
         update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
 
         # encoding the image
@@ -257,9 +261,9 @@ class InferenceCore(torch.nn.Module):
 
         # use the input mask if provided
         if mask is None:
-            pass
+            input_object_ids = []
         elif mask.shape[0] == 0:
-            objects = []
+            input_object_ids = []
         else:
             # resize mask to proper shape
             if resize_needed:
@@ -278,25 +282,27 @@ class InferenceCore(torch.nn.Module):
             # automatic mask assignment
             assigner = None
             labels = None
-            if isinstance(objects, ObjectAssignment):
+            if input_object_ids is True:
+                input_object_ids = ObjectAssignment()
+            if isinstance(input_object_ids, ObjectAssignment):
                 assert not idx_mask
-                assigner = objects
+                assigner = input_object_ids
                 mask, tmp_objects, labels = assigner(pred_prob_with_bg, mask)
-                objects = [self.object_manager.tmp_id_to_obj.get(i+1) if i is not None else None for i in tmp_objects]
+                input_object_ids = [self.object_manager.tmp_id_to_obj.get(i+1) if i is not None else None for i in tmp_objects]
             elif mask.ndim == 2:
-                if objects is None:
-                    objects = np.unique(mask)
+                if input_object_ids is None:
+                    input_object_ids = np.unique(mask)
 
             # if objects are not defined, assume they are in order
-            if objects is None:
+            if input_object_ids is None:
                 assert mask.ndim == 3
-                objects = list(range(1, mask.shape[0] + 1))
+                input_object_ids = list(range(1, mask.shape[0] + 1))
 
             
             # inform the manager of the new objects, and get a list of temporary id
             # temporary ids -- indicates the position of objects in the tensor
             # (starts with 1 due to the background channel)
-            corresponding_tmp_ids, objects = self._update_objects(objects, labels=labels)
+            corresponding_tmp_ids, input_object_ids = self._update_objects(input_object_ids, labels=labels)
 
             if need_segment:
                 # merge predicted mask with the incomplete input mask
@@ -310,7 +316,7 @@ class InferenceCore(torch.nn.Module):
                 new_masks = []
                 for mask_id, tmp_id in sorted(enumerate(corresponding_tmp_ids), key=lambda x: x[1]):
                     if idx_mask:
-                        this_mask = (mask == objects[mask_id]).type_as(pred_prob_no_bg)
+                        this_mask = (mask == input_object_ids[mask_id]).type_as(pred_prob_no_bg)
                     else:
                         this_mask = mask[mask_id]
                     if tmp_id-1 >= pred_prob_no_bg.shape[0]:
@@ -322,7 +328,7 @@ class InferenceCore(torch.nn.Module):
                 mask = torch.cat([pred_prob_no_bg, *new_masks], dim=0)
             elif idx_mask:
                 # simply convert cls to one-hot representation
-                if len(objects) == 0:
+                if len(input_object_ids) == 0:
                     if delete_buffer:
                         self.image_feature_store.delete(self.curr_ti)
                     log.warn('Trying to insert an empty mask as memory!')
@@ -330,13 +336,19 @@ class InferenceCore(torch.nn.Module):
                                        device=key.device,
                                        dtype=key.dtype)
                 mask = torch.stack(
-                    [mask == objects[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],
+                    [mask == input_object_ids[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],
                     dim=0)
             if assigner is not None:
                 mask = assigner.postprocess(mask)
             mask = self._purge_objects(mask)
             pred_prob_with_bg = aggregate(mask, dim=0)
             pred_prob_with_bg = torch.softmax(pred_prob_with_bg, dim=0)
+
+        if negative_mask is not None:
+            negative_mask = negative_mask >= 0.5
+            negative_mask, _ = pad_divide_by(negative_mask, 16)
+            pred_prob_with_bg[0, negative_mask] = 1
+            pred_prob_with_bg[1:, negative_mask] = 0
 
         self.last_mask = pred_prob_with_bg[1:].unsqueeze(0)
         if self.flip_aug:
@@ -365,8 +377,8 @@ class InferenceCore(torch.nn.Module):
                                         align_corners=False)[0]
             
         object_ids = np.array(self.object_manager.all_obj_ids)
-        if objects is not None:
-            objects = np.array(objects)
+        if input_object_ids is not None:
+            input_object_ids = np.array(input_object_ids)
 
         # convert probabilities to binary masks using argmax
         if self.binarize_mask:
@@ -380,7 +392,7 @@ class InferenceCore(torch.nn.Module):
             output_prob, object_ids = self._filter_confirmed(output_prob, object_ids)
 
         if self.return_object_ids:
-            return output_prob, object_ids, objects
+            return output_prob, object_ids, input_object_ids
         return output_prob
     step = forward
 
